@@ -183,7 +183,7 @@ public partial class MainViewModel : ObservableObject
 
         StepDefinitions.TypingFallbackMaxMs = _settings.TypeKeyMaxMs;
 
-        Log("Classroom Studio v0.9.70 — restrained ordinary curvature with explicit authored Circular Mode at 190–200");
+        Log("Classroom Studio v0.9.72 — Targeted New/Repeat optical routes, independent cooldowns and ARM 2.8.3 authored-tick HID");
 
         Log("Insert a step from the Insert menu, the left rail, or the right-click menu — then Connect and Run.");
 

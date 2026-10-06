@@ -1,3 +1,70 @@
+## v0.9.73 — continuous three-pixel human mouse reports
+
+- Native Pico mouse motion now treats three-pixel Euclidean continuity as a
+  hard transport contract: every authored `MMOVE` satisfies
+  `dx*dx + dy*dy <= 9`.
+- Larger Bezier points are expanded into ACK-paced Pico substeps. ARM 2.8.3
+  remains one command to one HID report, so the old hidden 1 ms ARM burst does
+  not return.
+- Exact endpoints, two-leg paths, correction legs, curvature, warm-up, pauses
+  and bounded wander remain intact.
+- The hardware motion harness now fails CI on any report above three pixels.
+- `PING` now reports the actual nine Native Guard light profiles instead of the
+  stale hard-coded value eight.
+
+## v0.9.72 — split Targeted optics and authored-tick ARM transport
+
+- Targeted now mirrors Whisper with two independent optical classifiers:
+  `Targeted New` and `Targeted Repeat`. Each owns a dedicated pipeline tab,
+  ABVM route and calibrated light range. As with Whisper, the New route has
+  no cooldown; only Repeat owns the board-local cooldown clock.
+- Native Guard carries nine light profiles. Calibration persistence can import
+  a binding-compatible eight-profile v3 record, and the `CALDUMP|LIGHT` mask
+  expands to four hexadecimal digits. Physical light
+  calibration now cycles through all nine stages and announces completion only
+  after `Targeted Repeat`.
+- `Targeted New` and `Targeted Repeat` play their own editable profile motifs;
+  the compiler contract rejects a fixture where their notification notes are
+  identical.
+- Once either Targeted light starts its bounded macro, Native Guard ignores
+  every later optical scene change until the macro finishes and the suspended
+  Game cursor is restored. A stable Login/DC reading is the sole exception
+  and immediately replaces Targeted with the disconnect-recovery route.
+- ARM 2.8.3-S5 no longer subdivides each v3.3 Pico `MMOVE` into 1–2 px reports.
+  Every bounded authored tick is emitted as one HID report, preserving the
+  intended velocity jitter while retaining defensive splitting above ±127.
+- The supplied 226.1 s game recording contained 6,485 cursor samples. Its
+  geometry removed the old 167° join failure (maximum observed turn 90°), but
+  74.8% of moving reports arrived within 0–3 ms and virtually none at the
+  authored 4–12 ms cadence. That evidence directly motivated ARM 2.8.3-S5.
+
+## v0.9.71 — hand-like motion texture and Targeted light cooldown
+
+- A full-session macro recording (332 s, 5,320 cursor samples) was compared
+  tick-by-tick against three real hand captures (84.9 s, 26,000 samples).
+  Three machine tells remained after v3.2: perfectly uniform ~4 px ticks (the
+  hand varies 6–68 px per 8 ms), near-perfect 0.93 path efficiency, and rare
+  167° kinks at leg joins.
+- Every leg now advances along the authored Cubic Bezier with jittered
+  per-tick progress (45–155%, triangular) plus rare bounded flicks
+  (200–300%, 8% chance, capped at 72 px/tick). Geometry and the exact endpoint
+  are unchanged; only the velocity profile became hand-like.
+- Moves of 80 px or more carry a subtle lateral tremor (1.5–3.5%, sometimes
+  4–8% of distance, 1–3 cycles, random phase) with a zero-at-both-ends
+  envelope, so paths stop reading as ruler-straight without risking targets.
+- Leg joins are now continuous: ordinary multi-leg moves blend the entry
+  control toward the previous exit tangent, and Circular Mode uses an exact
+  C1 join (the measured 124° circular kink dropped to the natural 45° range).
+- The first move after a 2.2 s or longer idle adds a bounded reaction delay
+  (80–350 ms) and runs its opening sixth at 1.6× tick pacing.
+- Targeted joins Whisper and Whisper Repeat with a board-local optical
+  cooldown (default 60,000 ms, editable in the Status section), so repeated
+  targeting no longer yanks the session out of Game back-to-back.
+- Firmware validation: the C smoke gains a deny-path check for the Targeted
+  cooldown, and a new host harness loops the ARM UART in software to measure
+  the real MMOVE stream (tick jitter, flick bounds, tremor envelope, join
+  angles, warm-up) on every CI run.
+
 ## v0.9.70 — restrained curvature and explicit Circular Mode
 
 - Hardware feedback showed visibly excessive bowing across ordinary v3.1

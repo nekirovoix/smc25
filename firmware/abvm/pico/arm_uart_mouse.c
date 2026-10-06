@@ -21,6 +21,8 @@
 #define HUMAN_SCREEN_DEFAULT_H 1080
 #define HUMAN_PATH_MAX_STEPS 96u
 #define HUMAN_PATH_MIN_STEPS 16u
+#define HUMAN_REPORT_MAX_DISTANCE_SQ 9u
+#define HUMAN_SUBSTEP_INTERVAL_MS 2u
 
 typedef enum ArmState { ARM_IDLE, ARM_PROBE, ARM_MOVE, ARM_SOUND_ARM, ARM_SOUND_CANCEL, ARM_SOUND_CAL, ARM_HALT, ARM_FAULT } ArmState;
 typedef enum HumanPathPhase {
@@ -55,6 +57,20 @@ typedef struct HumanPath {
     uint16_t step_delay_ms, after_ms;
     uint16_t mid_pause_ms, mid_pause_step;
     bool second_leg_pending;
+    /* v3.3 hand-motion fields */
+    uint32_t progress_q16;     /* jittered progress along the leg */
+    uint32_t pending_progress_q16;
+    uint16_t pending_step;
+    int32_t pending_x, pending_y;
+    bool point_pending;
+    uint16_t leg_distance;     /* px, for per-tick cap and wander scale */
+    int32_t norm_x, norm_y;    /* leg normal, q15 */
+    uint16_t wander_amp;       /* px lateral tremor amplitude, 0 disables */
+    uint16_t wander_cycles_q8; /* tremor cycles across the leg, q8 */
+    uint32_t wander_phase;     /* q16 start phase */
+    uint16_t warmup_steps;     /* slower opening steps after a long idle */
+    uint8_t flick_chance;      /* percent chance of a short velocity burst */
+    uint8_t flick_left;        /* remaining burst steps */
 } HumanPath;
 static ArmState state;
 static char tx[ARM_FRAME_MAX];
@@ -98,6 +114,11 @@ static bool human_boot_mixed;
 static uint8_t human_turn_p90_deg = 18u;
 static int8_t human_side_lock;
 static int32_t human_leg_curve_min, human_leg_curve_max;
+/* v3.3: leg-join continuity and post-idle warm-up state */
+static int32_t human_exit_x, human_exit_y;
+static uint32_t human_exit_distance;
+static bool human_leg_continue;
+static uint32_t human_last_move_end;
 
 static bool reached(uint32_t now, uint32_t due) { return (int32_t)(now - due) >= 0; }
 static uint32_t random_next(void) {
@@ -312,10 +333,12 @@ static int32_t q16_cubic(int32_t end,int32_t control1,int32_t control2,
                     (int64_t)t*t*t*end;
     return (int32_t)(value >> 48);
 }
-static uint32_t smooth_q16(uint16_t step, uint16_t steps) {
-    uint32_t t = ((uint32_t)step << 16) / steps;
+static uint32_t ease_q16(uint32_t t) {
     uint64_t t2 = ((uint64_t)t * t) >> 16;
     return (uint32_t)((t2 * (196608u - 2u * t)) >> 16);
+}
+static uint32_t smooth_q16(uint16_t step, uint16_t steps) {
+    return ease_q16(((uint32_t)step << 16) / steps);
 }
 static uint32_t human_curve_height_per_mille(int32_t curve_pct) {
     int32_t curve=clamp_i32(curve_pct,0,200);
@@ -389,28 +412,163 @@ static void human_leg(int32_t end_x, int32_t end_y, uint16_t steps,
         human_path.control2_y=clamp_i32(global2_y,human_soft_margin_y,
             human_screen_h-1-human_soft_margin_y)-human_virtual_y;
     }
+    human_path.leg_distance=(uint16_t)(distance>65535u?65535u:distance);
+    human_path.norm_x=distance?
+        (int32_t)((-(int64_t)end_y*32768)/(int32_t)distance):0;
+    human_path.norm_y=distance?
+        (int32_t)(((int64_t)end_x*32768)/(int32_t)distance):0;
+    if(human_leg_continue&&(human_exit_x||human_exit_y)&&
+       human_exit_distance){
+        if(human_side_lock){
+            /* Circular mode owns both legs of one coherent arc: make the
+             * waypoint join exactly C1 so the rotation never kinks. */
+            int64_t scale=((int64_t)distance<<16)/
+                          (3*(int64_t)human_exit_distance);
+            human_path.control1_x=(int32_t)((human_exit_x*scale)>>16);
+            human_path.control1_y=(int32_t)((human_exit_y*scale)>>16);
+        } else {
+            /* C1-ish join: pull the entry control toward the previous leg's
+             * exit tangent so waypoint joins stop producing sharp kinks. */
+            int32_t blend_x=human_exit_x/5,blend_y=human_exit_y/5;
+            int32_t cap=(int32_t)(distance/8u+1u);
+            blend_x=clamp_i32(blend_x,-cap,cap);
+            blend_y=clamp_i32(blend_y,-cap,cap);
+            human_path.control1_x+=blend_x;
+            human_path.control1_y+=blend_y;
+        }
+    }
+    human_leg_continue=false;
+    human_exit_x=human_path.leg_x-human_path.control2_x;
+    human_exit_y=human_path.leg_y-human_path.control2_y;
+    human_exit_distance=distance?distance:1u;
+    human_path.progress_q16=0u;
+    human_path.pending_progress_q16=0u;
+    human_path.pending_step=0u;
+    human_path.pending_x=human_path.pending_y=0;
+    human_path.point_pending=false;
+    human_path.flick_left=0u;
     human_path.last_x = human_path.last_y = 0;
     human_path.steps = steps;
     human_path.step = 0u;
 }
+static void human_cap_report(int32_t dx,int32_t dy,int32_t *out_x,
+                             int32_t *out_y) {
+    int32_t best_x=0,best_y=0;
+    int64_t best_dot=0,best_norm=1;
+    for(int32_t x=-3;x<=3;++x)for(int32_t y=-3;y<=3;++y){
+        int32_t norm=x*x+y*y;
+        if(!norm||(uint32_t)norm>HUMAN_REPORT_MAX_DISTANCE_SQ)continue;
+        int64_t dot=(int64_t)dx*x+(int64_t)dy*y;
+        if(dot<=0)continue;
+        int64_t dot_sq=dot*dot;
+        int64_t best_sq=best_dot*best_dot;
+        if(!best_dot||dot_sq*best_norm>best_sq*norm||
+           (dot_sq*best_norm==best_sq*norm&&dot>best_dot)){
+            best_x=x;best_y=y;best_dot=dot;best_norm=norm;
+        }
+    }
+    if(!best_dot){
+        if(dx)best_x=dx>0?1:-1;
+        else if(dy)best_y=dy>0?1:-1;
+    }
+    *out_x=best_x;*out_y=best_y;
+}
 static bool human_path_command(char *command, size_t capacity) {
     if (human_path.phase != HUMAN_PATH_MOVE &&
         human_path.phase != HUMAN_PATH_CORRECT) return false;
-    if (human_path.step >= human_path.steps) return false;
-    uint16_t next = (uint16_t)(human_path.step + 1u);
-    uint32_t t = smooth_q16(next, human_path.steps);
-    int32_t x=q16_cubic(human_path.leg_x,human_path.control1_x,
-                        human_path.control2_x,t);
-    int32_t y=q16_cubic(human_path.leg_y,human_path.control1_y,
-                        human_path.control2_y,t);
-    int32_t dx = x - human_path.last_x;
-    int32_t dy = y - human_path.last_y;
-    human_path.last_x = x; human_path.last_y = y; human_path.step = next;
-    if (!dx && !dy && next < human_path.steps)
-        return human_path_command(command, capacity);
-    int n = snprintf(command, capacity, "MMOVE|%ld,%ld,rel,2",
-                     (long)dx, (long)dy);
-    return n > 0 && (size_t)n < capacity;
+    for(;;){
+        if(!human_path.point_pending){
+            if (human_path.step >= human_path.steps) return false;
+            uint16_t next = (uint16_t)(human_path.step + 1u);
+            /* The hand-authored point may be farther than one physical HID
+             * report. Keep the velocity texture in point timing, but drain
+             * each point through continuous <=3 px reports on the Pico side.
+             * ARM remains one authored command -> one HID report. */
+            uint32_t base = 65536u / human_path.steps;
+            uint32_t jpct = 100u;
+            if (human_path.phase == HUMAN_PATH_MOVE) {
+                jpct = 45u + ((random_next() % 111u) +
+                              (random_next() % 111u)) / 2u;
+                if (human_path.flick_left) {
+                    jpct = 200u + random_next() % 101u;
+                    --human_path.flick_left;
+                } else if (human_path.flick_chance &&
+                           (random_next() % 100u) <
+                               human_path.flick_chance) {
+                    human_path.flick_left =
+                        (uint8_t)(1u + random_next() % 2u);
+                    jpct = 200u + random_next() % 101u;
+                }
+            }
+            uint32_t inc = (base * jpct) / 100u;
+            if (!inc) inc = 1u;
+            if (human_path.leg_distance) {
+                uint32_t cap = (uint32_t)(((uint64_t)72u << 16) /
+                                          human_path.leg_distance);
+                uint32_t floor = base * 2u;
+                if (cap < floor) cap = floor;
+                if (inc > cap) inc = cap;
+            }
+            uint32_t progress = human_path.progress_q16 + inc;
+            if (next >= human_path.steps || progress >= 65536u) {
+                progress = 65536u;
+                next = human_path.steps;
+            }
+            uint32_t t = ease_q16(progress);
+            int32_t x=q16_cubic(human_path.leg_x,
+                                human_path.control1_x,
+                                human_path.control2_x,t);
+            int32_t y=q16_cubic(human_path.leg_y,
+                                human_path.control1_y,
+                                human_path.control2_y,t);
+            if (human_path.wander_amp &&
+                human_path.phase == HUMAN_PATH_MOVE) {
+                uint32_t envelope = progress < 32768u ? progress * 2u :
+                                    (65536u - progress) * 2u;
+                uint32_t phase = human_path.wander_phase + (uint32_t)(
+                    ((uint64_t)progress *
+                     human_path.wander_cycles_q8) >> 8);
+                uint32_t tri = phase & 65535u;
+                tri = tri < 32768u ? tri * 2u :
+                                     (65536u - tri) * 2u;
+                int32_t centered = (int32_t)tri - 32768;
+                int32_t offset = (int32_t)(
+                    ((int64_t)human_path.wander_amp * centered *
+                     (int32_t)envelope) / 2147483648LL);
+                x += (int32_t)(
+                    ((int64_t)human_path.norm_x * offset) / 32768);
+                y += (int32_t)(
+                    ((int64_t)human_path.norm_y * offset) / 32768);
+            }
+            human_path.pending_x=x;
+            human_path.pending_y=y;
+            human_path.pending_progress_q16=progress;
+            human_path.pending_step=next;
+            human_path.point_pending=true;
+        }
+        int32_t dx=human_path.pending_x-human_path.last_x;
+        int32_t dy=human_path.pending_y-human_path.last_y;
+        uint64_t distance_sq=(uint64_t)((int64_t)dx*dx)+
+                             (uint64_t)((int64_t)dy*dy);
+        if(distance_sq>HUMAN_REPORT_MAX_DISTANCE_SQ){
+            int32_t report_x,report_y;
+            human_cap_report(dx,dy,&report_x,&report_y);
+            human_path.last_x+=report_x;
+            human_path.last_y+=report_y;
+            int n=snprintf(command,capacity,"MMOVE|%ld,%ld,rel,2",
+                           (long)report_x,(long)report_y);
+            return n>0&&(size_t)n<capacity;
+        }
+        human_path.last_x=human_path.pending_x;
+        human_path.last_y=human_path.pending_y;
+        human_path.progress_q16=human_path.pending_progress_q16;
+        human_path.step=human_path.pending_step;
+        human_path.point_pending=false;
+        if(!dx&&!dy&&human_path.step<human_path.steps)continue;
+        int n=snprintf(command,capacity,"MMOVE|%ld,%ld,rel,2",
+                       (long)dx,(long)dy);
+        return n>0&&(size_t)n<capacity;
+    }
 }
 static bool human_path_begin(const uint8_t *payload, uint32_t size,
                              uint8_t path_lane, uint32_t now) {
@@ -591,7 +749,7 @@ static bool human_path_begin(const uint8_t *payload, uint32_t size,
     }
     duration = (uint32_t)clamp_i32((int32_t)duration, 120, 3000);
     uint16_t steps = (uint16_t)clamp_i32(
-        (int32_t)((distance + 3u) / 4u),
+        (int32_t)((distance + 5u) / 6u),
         HUMAN_PATH_MIN_STEPS, HUMAN_PATH_MAX_STEPS);
 
     memset(&human_path, 0, sizeof(human_path));
@@ -606,6 +764,20 @@ static bool human_path_begin(const uint8_t *payload, uint32_t size,
     if(hand_tempo_ms)
         human_path.step_delay_ms=(uint16_t)clamp_i32(
             (human_path.step_delay_ms*3+hand_tempo_ms)/4,2,40);
+    /* v3.3: bursts belong to deliberate motion, not to 2 px twitches. */
+    human_path.flick_chance=distance>=60u?8u:0u;
+    /* v3.3: most moves carry a light tremor; some wander visibly.  Both stay
+     * far below the authored curve bands and vanish at the endpoints. */
+    if(distance>=80u) {
+        uint32_t wander_pct=(random_next()%100u)<85u?
+            random_range_u32(15u,35u):random_range_u32(40u,80u);
+        human_path.wander_amp=(uint16_t)clamp_i32(
+            (int32_t)(distance*wander_pct/1000u),1,40);
+        human_path.wander_cycles_q8=(uint16_t)(
+            random_range_u32(1u,3u)<<8);
+        human_path.wander_phase=random_next();
+    } else human_path.wander_amp=0u;
+    human_leg_continue=false;
     int32_t before_min = clamp_i32(
         json_int_or(payload,size,"pauseBeforeMin",120), 0, 30000);
     int32_t before_max = clamp_i32(
@@ -622,6 +794,17 @@ static bool human_path_begin(const uint8_t *payload, uint32_t size,
     }
     human_path.next_due = now + human_personal_pause(
         (uint32_t)before_min,(uint32_t)before_max,behavior,&personal);
+    /* v3.3: a hand that rested needs a beat to re-engage; the opening steps
+     * of the first move after a long idle run slower instead of snapping to
+     * full cruise speed. */
+    if(human_last_move_end) {
+        uint32_t idle_gap=now-human_last_move_end;
+        if((int32_t)idle_gap>=0&&idle_gap>=2200u) {
+            human_path.next_due+=(uint32_t)clamp_i32(
+                (int32_t)(idle_gap/32u),80,350);
+            human_path.warmup_steps=(uint16_t)(steps/6u?steps/6u:1u);
+        }
+    }
     human_path.after_ms = (uint16_t)human_personal_pause(
         (uint32_t)after_min,(uint32_t)after_max,behavior,&personal);
     int32_t idle_every_min=clamp_i32(
@@ -851,6 +1034,9 @@ void arm_uart_mouse_init(void) {
     human_mode=HUMAN_MODE_NORMAL;human_mode_moves_left=0u;
     human_move_serial=0u;human_boot_mixed=false;human_turn_p90_deg=18u;
     human_side_lock=0;human_leg_curve_min=human_leg_curve_max=0;
+    human_exit_x=human_exit_y=0;human_leg_continue=false;
+    human_last_move_end=0u;
+    (void)smooth_q16;
     prng=0x6d2b79f5u;
 }
 bool arm_uart_mouse_probe(uint32_t now) {
@@ -1120,6 +1306,7 @@ static void handle_line(uint32_t now) {
                     human_path.start_x=human_virtual_x;
                     human_path.start_y=human_virtual_y;
                     human_path.second_leg_pending=false;
+                    human_leg_continue=true;
                     human_leg(next_x,next_y,next_steps,next_curve);
                     human_path.next_due=now+random_range_u32(12u,45u);
                 } else if(human_path.phase==HUMAN_PATH_MOVE&&
@@ -1131,6 +1318,9 @@ static void handle_line(uint32_t now) {
                     uint16_t correction_steps=human_path.correction_steps;
                     human_path.phase=HUMAN_PATH_CORRECT;
                     human_path.correction_steps=0u;
+                    human_path.flick_chance=0u;
+                    human_path.wander_amp=0u;
+                    human_leg_continue=true;
                     human_leg_curve_min=human_leg_curve_max=8;
                     human_leg(correction_x,correction_y,correction_steps,8);
                     human_path.next_due=now+random_range_u32(70u,160u);
@@ -1138,11 +1328,16 @@ static void handle_line(uint32_t now) {
                     human_virtual_x=human_path.target_x;
                     human_virtual_y=human_path.target_y;
                     human_side_lock=0;
+                    human_last_move_end=now;
                     human_path.phase=HUMAN_PATH_AFTER;
                     human_path.next_due=now+human_path.after_ms;
                 }
             } else {
-                uint32_t pause=human_path.step_delay_ms;
+                uint32_t pause=human_path.point_pending?
+                    HUMAN_SUBSTEP_INTERVAL_MS:human_path.step_delay_ms;
+                if(human_path.warmup_steps&&
+                   human_path.step<human_path.warmup_steps)
+                    pause=pause*8u/5u+1u;
                 if(human_path.mid_pause_ms&&
                    human_path.step>=human_path.mid_pause_step) {
                     pause+=human_path.mid_pause_ms;

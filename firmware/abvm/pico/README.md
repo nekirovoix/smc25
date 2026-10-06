@@ -21,6 +21,13 @@ The patcher validates UF2 framing, requires exactly one compatible slot, checks 
 
 The image exposes TinyUSB CDC and a real HID keyboard actor. `RMOUSE` is routed to the ARM board over UART0 on GP16/GP17 at 57600 baud with checksum framing. Relative motion completes only after `OK|MMOVE`; malformed replies, ARM errors, RX overflow, and ACK timeout fail closed. Release-all emits a zero keyboard report and framed `HALT`. `TYPE` is a real allocation-free, nonblocking TinyUSB actor: it preserves held modifiers, supports printable US-ASCII plus Enter/Tab, applies per-key, word, punctuation and thinking delays, and performs bounded typo/backspace correction. Clipboard, secret, malformed JSON, and non-ASCII payloads fail closed instead of being silently typed.
 
+Human `RMOUSE` paths enforce physical pixel continuity before UART transport:
+every Pico-authored `MMOVE` satisfies `dx*dx + dy*dy <= 9`. A farther Bezier
+point is drained through ACK-paced Pico substeps before authored progress
+advances. ARM 2.8.3 therefore remains one command to one HID report; exact
+endpoints, curves, corrections and timing texture are preserved without
+restoring the hidden ARM-side 1 ms subdivision.
+
 `WATCH` carries typed descriptors. Sound descriptors contain profile ID, threshold, and sustained-duration requirements; Pico arms ARM 2.8 with framed `ASND`, continues mouse service while the ADC listener runs, consumes `EVT|ASND|DETECTED/TIMEOUT`, and feeds detections directly into `abvm_sound_detected()`. Light descriptors contain the BH1750 lux range, stable duration, and high/low-resolution mode. The native I2C0 actor on GP20/GP21 samples without sleeping, requires an uninterrupted in-range window, and resumes the exact VM lane through `abvm_light_detected()`. Missing sensors fail closed instead of skipping a guard.
 
 The same native BH1750 actor serves read-only `LUX?` telemetry and asynchronous `LCAL|ms` calibration. Calibration accumulates min/max/average in fixed state while USB, HID, ARM UART, buttons, and the VM continue to run. Pause/Stop/route boundaries cancel active watches; ARM sound is additionally cancelled through framed `HALT`.
@@ -32,9 +39,9 @@ actor as ABVM, and `BEEP|hz,durationMs` uses the nonblocking GP6 PWM actor.
 For ABVM Wait For Sound, the step's `threshold` is authoritative; zero opts
 into the persisted physical calibration for that profile.
 
-A typed `GUARD` constant embeds the six calibrated optical profiles exported by Classroom Studio. The allocation-free global Guard applies unique-range classification, per-profile stability, hysteresis, sensor freshness, ordered Desktop → Login → Dashboard → Loading → Game progression, Targeted as a Game side-state, and the dedicated DC fallback route. GP4 or `GUARD|ON` starts Guard at the physical state currently visible; `GUARD|OFF`/`HALT` stops it. Missing/ambiguous light never invents a state, sensor timeout stops execution, and every accepted transition starts the matching verified ABVM route.
+A typed `GUARD` constant embeds the nine calibrated optical profiles exported by Classroom Studio. The allocation-free global Guard applies unique-range classification, per-profile stability, hysteresis, sensor freshness, ordered Desktop → Login → Dashboard → Loading → Game progression, split Targeted New/Repeat Game side-states, and the dedicated DC fallback route. GP4 or `GUARD|ON` starts Guard at the physical state currently visible; `GUARD|OFF`/`HALT` stops it. Missing/ambiguous light never invents a state, sensor timeout stops execution, and every accepted transition starts the matching verified ABVM route.
 
-Implemented: native ABP verification, millisecond scheduler, CDC control, Key/KDown/KUp/Type, bounded relative mouse, nonblocking ARM UART sound watch, nonblocking BH1750 Light Watch/calibration, global eight-profile Guard routing, HALT on every release boundary, GP3 Pause/Resume, GP4 Guard Start/Stop, independent Whisper New/Repeat interrupts, nonblocking original GP6 passive-buzzer presets, and fail-closed boot/transport behavior.
+Implemented: native ABP verification, millisecond scheduler, CDC control, Key/KDown/KUp/Type, bounded relative mouse, nonblocking ARM UART sound watch, nonblocking BH1750 Light Watch/calibration, global nine-profile Guard routing, HALT on every release boundary, GP3 Pause/Resume, GP4 Guard Start/Stop, independent Targeted New/Repeat and Whisper New/Repeat interrupts, nonblocking original GP6 passive-buzzer presets, and fail-closed boot/transport behavior.
 
 Whisper New and Whisper Repeat are bounded, non-preemptible overlays. Guard
 ignores all optical scene changes—including a temporary return to Desktop—until
@@ -44,9 +51,16 @@ whether the Whisper interrupt originated from light, sound, or manual control.
 The sole exception is a stable Login/DC profile: disconnect recovery has
 priority, cancels the transient Whisper overlay, and starts the DC route.
 
+Targeted New and Targeted Repeat use the same bounded optical lock. Once
+either light signature starts its interrupt route, Game, Desktop, Whisper,
+the other Targeted signature, and unknown/ambiguous light cannot preempt it.
+All Targeted steps finish before the suspended Game cursor is restored. The
+sole optical exception is a stable Login/DC profile, which immediately
+replaces Targeted with the disconnect-recovery route.
+
 ## Passive buzzer on GP6
 
-The native adapter preserves physical feedback on the existing GP6 → resistor → S8050 circuit. Guard Start/Stop/Pause/Resume use the legacy multi-note patterns. Every confirmed transition after the initial state emits a distinct 150 ms profile-dependent rising sweep. Light calibration uses eight memorable 3–4 note motifs; Classroom Studio exposes a separate assignment menu so every environment can use any motif and preview it on the connected board. The selected cue IDs are stored in the Native Guard descriptor and require no PC helper at runtime. Sound calibration retains ID 1/2/3 selection, silence-start, target-start, save/error, and enter/exit feedback.
+The native adapter preserves physical feedback on the existing GP6 → resistor → S8050 circuit. Guard Start/Stop/Pause/Resume use the legacy multi-note patterns. Every confirmed transition after the initial state emits a distinct 150 ms profile-dependent rising sweep. Light calibration uses nine memorable 3–4 note motifs; Classroom Studio exposes a separate assignment menu so every environment can use any motif and preview it on the connected board. The selected cue IDs are stored in the Native Guard descriptor and require no PC helper at runtime. Sound calibration retains ID 1/2/3 selection, silence-start, target-start, save/error, and enter/exit feedback.
 
 Whisper New and Whisper Repeat also carry independent board-only optical cooldowns in the Native Guard descriptor. A brief return to the same light signature during cooldown is ignored even when both global sound listeners are disabled. Classroom Studio accepts up to 3,600,000 ms (60 minutes) per optical Whisper cooldown.
 
