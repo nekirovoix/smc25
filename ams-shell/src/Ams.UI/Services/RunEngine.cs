@@ -98,9 +98,19 @@ public sealed class RunEngine
 
     public async Task RunAsync(IEnumerable<StepNode> roots, CancellationToken ct)
     {
-        _mouseAnchor = System.Windows.Forms.Cursor.Position;   // v0.9.20 — anchor syncs at run start
         _parallelKeySeq = 0; _lastParallelKeyTick = 0; _mouseRestAtSeq = -1;   // v0.9.23 — reset typing signal
         await Send($"SETRES|{_screenW},{_screenH}", ct);
+        // SETRES updates the display bounds, not the Pro Micro's tracked cursor.
+        // The host cursor may have moved with a physical mouse since the board last
+        // emitted HID, so anchor the board at the live Windows position before any
+        // absolute human path. abs,0 is a no-op when both positions already agree.
+        var liveCursor = System.Windows.Forms.Cursor.Position;
+        _mouseAnchor = liveCursor;
+        if (liveCursor.X >= 0 && liveCursor.X < _screenW && liveCursor.Y >= 0 && liveCursor.Y < _screenH)
+        {
+            await SendMmoveAbsAsync(liveCursor.X, liveCursor.Y, ct);
+            _log($"mouse: board cursor synchronized to live position ({liveCursor.X},{liveCursor.Y})");
+        }
         // v0.9.28 — prime the vision hot path (tier-1 JIT + pooled allocators) BEFORE the first
         // findImage: a cold first entireScreen poll round took ~15 s once, so playAudio fired ~15 s
         // after the image was already visible. One small synthetic match here makes round 1 fast.
@@ -498,26 +508,30 @@ public sealed class RunEngine
                     // handSample is a relative gesture from the cursor's current position.
                     // There is deliberately no absolute destination: a bare HID device cannot
                     // know the host cursor origin without a Windows-side bridge.
-                    if (PropEx.GetString(s.Props, "moveMode", "fixed") == "handSample"
-                        && HandMovementSample.TryDecode(PropEx.GetString(s.Props, "handSample"), out var handSample))
+                    if (PropEx.GetString(s.Props, "moveMode", "fixed") == "handSample")
                     {
+                        if (!HandMovementSample.TryDecode(PropEx.GetString(s.Props, "handSample"), out var handSample))
+                            throw new InvalidOperationException("mouseMove handSample mode needs a valid recorded movement.");
                         await ReplayHandMovementAsync(handSample, ct);
-                    }
-                    else if (PropEx.GetBool(s.Props, "human", true))
-                    {
-                        // v0.9.14 — tunable per step (dialog fields, Gentle defaults) instead of
-                        // the fixed preset; every cursor move in the app is now configurable.
-                        await HumanMoveToAsync(PropEx.GetInt(s.Props, "x", 600), PropEx.GetInt(s.Props, "y", 497),
-                                               HumanMouse.Config.FromProps(s.Props, _mouseSpeedMin, _mouseSpeedMax, gentleDefaults: true), ct);
                     }
                     else
                     {
-                        string rawCmd = StepDefinitions.GetCommands(s)[0];
-                        await Send(rawCmd, ct);
-                        // v0.9.20 — keep the cursor anchor in sync (format: MMOVE|x,y,abs,h)
-                        var parts = rawCmd.Split('|', ',');
-                        if (parts.Length >= 3 && int.TryParse(parts[1], out int ax) && int.TryParse(parts[2], out int ay))
-                            _mouseAnchor = new System.Drawing.Point(ax, ay);
+                        var (x, y, w, h) = GetMouseMoveRegion(s);
+                        int destX, destY;
+                        lock (_rngLock)
+                        {
+                            // Sample a new point on every execution; the region is a target
+                            // surface, not a point that merely needs to be entered.
+                            destX = x + Rng.Next(w);
+                            destY = y + Rng.Next(h);
+                        }
+                        // v0.9.14 — tunable per step (dialog fields, Gentle defaults) instead of
+                        // the fixed preset; every cursor move in the app is now configurable.
+                        if (PropEx.GetBool(s.Props, "human", true))
+                            await HumanMoveToAsync(destX, destY,
+                                HumanMouse.Config.FromProps(s.Props, _mouseSpeedMin, _mouseSpeedMax, gentleDefaults: true), ct);
+                        else
+                            await SendMmoveAbsAsync(destX, destY, ct);
                     }
                     break;
                 }
@@ -959,6 +973,18 @@ public sealed class RunEngine
     /// <summary>v0.9.15 — thread-safe inclusive random (Parallel Group branches share Rng).</summary>
     private int NextRandom(int min, int max) { lock (_rngLock) return Rng.Next(min, max + 1); }
 
+    private (int X, int Y, int W, int H) GetMouseMoveRegion(StepNode step)
+    {
+        int x = PropEx.GetInt(step.Props, "x", 600);
+        int y = PropEx.GetInt(step.Props, "y", 497);
+        int w = PropEx.GetInt(step.Props, "w", 1);
+        int h = PropEx.GetInt(step.Props, "h", 1);
+        if (x < 0 || y < 0 || w <= 0 || h <= 0 || x + (long)w > _screenW || y + (long)h > _screenH)
+            throw new InvalidOperationException(
+                $"mouseMove rectangle [{x},{y} {w}x{h}] must be inside the configured display {_screenW}x{_screenH}.");
+        return (x, y, w, h);
+    }
+
     /// <summary>v0.9.21 — split a KTEXT op into one INSTANT op per character ("KTEXT|0,0,&lt;c&gt;",
     /// no board-side per-key delay), so a Parallel Group's keyboard branch holds the single
     /// serial channel for milliseconds instead of a full keystroke delay. The caller re-adds
@@ -1070,10 +1096,9 @@ public sealed class RunEngine
     /// every-N-moves break when the planner says one is due.</summary>
     private async Task HumanMoveToAsync(int tx, int ty, HumanMouse.Config cfg, CancellationToken ct)
     {
-        // v0.9.20 — plan from the app-side cursor anchor, not the racy OS read: with parallel
-        // branches the OS position can lag the commands we have already issued, which made the
-        // next path start from a stale point and the cursor visibly jump back mid-run.
-        var start = _mouseAnchor ?? System.Windows.Forms.Cursor.Position;   // v0.8.5 — anchor, never the region corner
+        // v0.9.20 — plan from the app-side cursor anchor, updated by every move in
+        // this run. RunAsync synchronizes it with Windows and the board before steps begin.
+        var start = _mouseAnchor ?? System.Windows.Forms.Cursor.Position;   // never the region corner
         HumanMouse.Plan plan;
         lock (_rngLock)   // v0.9.15 — shared RNG + pause planner are not thread-safe (Parallel Group)
             plan = HumanMouse.PlanMove(start.X, start.Y, tx, ty, cfg, MousePauses, Rng, _screenW, _screenH);
