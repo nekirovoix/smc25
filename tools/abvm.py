@@ -331,7 +331,7 @@ class Compiler:
         self.display_profile: dict[str, int] = {}
 
     @staticmethod
-    def compact_human_mouse_profile(source: dict[str, Any]) -> dict[str, int]:
+    def compact_human_mouse_profile(source: dict[str, Any], minimum_duration: int = 30_000) -> dict[str, int]:
         profile = source.get("humanMouseProfile") or {}
         encoded = str(profile.get("EncodedSample") or
                       profile.get("encodedSample") or "")
@@ -339,7 +339,7 @@ class Compiler:
                            profile.get("durationMs"))
         if not profile:
             return {}
-        if duration < 30_000 or not encoded.startswith("v1|"):
+        if duration < minimum_duration or not encoded.startswith("v1|"):
             raise AbvmError(
                 "Native Export needs a valid 30-second human mouse profile")
         fields = encoded.split("|", 4)
@@ -672,6 +672,53 @@ class Compiler:
                 self.emit(OP_DELAY, b=lo, c=hi)
             self.map_range(first, len(self.code), node, node_path)
 
+    def mouse_speed_controls(self, spec: dict[str, Any]) -> None:
+        modes = {"legacy": 0, "profile": 1, "slow": 2, "normal": 3,
+                 "fast": 4, "mixed": 5, "custom": 6}
+        mode = str(spec.get("speedMode") or "legacy")
+        source = str(spec.get("handProfileSource") or "legacy")
+        if mode not in modes or source not in ("legacy", "global", "local"):
+            raise AbvmError("unknown mouse speed mode or profile source")
+        if source == "global":
+            if not self.human_mouse_profile:
+                raise AbvmError("global mouse profile is missing")
+            spec["handSample"] = ""
+        elif source == "local":
+            encoded = str(spec.get("handSample") or "")
+            try:
+                duration = int(encoded.split("|", 2)[1])
+            except (ValueError, IndexError):
+                raise AbvmError("local mouse sample is missing or invalid")
+            if duration < 10_000:
+                raise AbvmError("local mouse sample needs at least 10 seconds")
+            spec.update(self.compact_human_mouse_profile({
+                "humanMouseProfile": {"EncodedSample": encoded,
+                                      "DurationMs": duration}}, minimum_duration=10_000))
+        spec["handProfileSourceId"] = 1 if source == "local" else 0
+        spec["speedControl"] = modes[mode]
+        if mode == "legacy":
+            return
+        if source == "legacy":
+            raise AbvmError("new speed controls need an explicit global or local profile source")
+        if not spec.get("handProfileV2"):
+            raise AbvmError("speed controls require a recorded hand profile")
+        ceiling = integer(spec.get("handSpeedMax"))
+        cap = integer(spec.get("speedCapPxPerSec")) or ceiling
+        if not 150 <= cap <= ceiling:
+            raise AbvmError("mouse speed cap must be 150..recorded hand maximum")
+        spec["speedCap"] = cap
+        weights = [integer(spec.get(k), v) for k, v in
+                   (("speedSlowWeight", 20), ("speedNormalWeight", 50),
+                    ("speedFastWeight", 30))]
+        if any(w < 0 or w > 100 for w in weights) or sum(weights) == 0:
+            raise AbvmError("speed weights must be 0..100 with a positive sum")
+        for key, value in zip(("speedSlowWeight", "speedNormalWeight", "speedFastWeight"), weights):
+            spec[key] = value
+        lo, hi = integer(spec.get("speedCustomMin"), 300), integer(spec.get("speedCustomMax"), 530)
+        if mode == "custom" and not 150 <= lo <= hi <= cap:
+            raise AbvmError("custom speed must be ordered and inside the hand cap")
+        spec["speedCustomMin"], spec["speedCustomMax"] = lo, hi
+
     def compile_node(self, node: dict[str, Any], depth: int,
                      path: tuple[int, ...]) -> None:
         kind, p = step_type(node), props(node)
@@ -709,6 +756,14 @@ class Compiler:
             spec = dict(p)
             spec.update(self.human_mouse_profile)
             spec.update(self.display_profile)
+            self.mouse_speed_controls(spec)
+            # Native actor reads compact signature/tempo before the raw trace.
+            # Once those values exist, the full handSample is unreachable runtime
+            # data, not replay instructions. Drop it rather than copy 20KB into
+            # every mouse constant (the .amsj source remains untouched).
+            signature, tempo = integer(spec.get("handSignature"), -1), integer(spec.get("handTempoMs"), -1)
+            if 0 <= signature <= 65535 and 2 <= tempo <= 20:
+                spec.pop("handSample", None)
             intent = str(spec.get("motionIntent") or "targetRegion")
             if intent in ("microTwitch", "mediumTwitch"):
                 defaults = (2, 12) if intent == "microTwitch" else (20, 80)
@@ -718,6 +773,8 @@ class Compiler:
                 spec["relativeMode"] = 1
                 spec["relativeMin"] = max(1, lo)
                 spec["relativeMax"] = max(1, hi)
+                for key in ("x", "y", "w", "h", "twitchMinPx", "twitchMaxPx", "motionIntent"):
+                    spec.pop(key, None)
             else:
                 x, y = integer(spec.get("x")), integer(spec.get("y"))
                 w, h = integer(spec.get("w"), 100), integer(spec.get("h"), 100)
@@ -738,6 +795,9 @@ class Compiler:
             spec = dict(p)
             spec.update(self.human_mouse_profile)
             spec.update(self.display_profile)
+            signature, tempo = integer(spec.get("handSignature"), -1), integer(spec.get("handTempoMs"), -1)
+            if 0 <= signature <= 65535 and 2 <= tempo <= 20:
+                spec.pop("handSample", None)
             spec["motionIntent"] = "targetRegion"
             x, y = integer(spec.get("x")), integer(spec.get("y"))
             w, h = integer(spec.get("w"), 1), integer(spec.get("h"), 1)
